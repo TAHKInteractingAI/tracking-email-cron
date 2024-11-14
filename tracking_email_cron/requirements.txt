@@ -1,5 +1,0 @@
-pandas
-python-dotenv
-nylas
-pendulum
-google-api-python-client
