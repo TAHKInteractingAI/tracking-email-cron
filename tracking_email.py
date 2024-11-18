@@ -41,6 +41,16 @@ values = [row + [''] * (max_cols - len(row)) for row in values]
 df = pd.DataFrame(values[1:], columns=values[0])
 df = df.fillna('')
 # df.head()
+
+RANGE_NAME_1 = 'sending_email'
+sheet_1 = spreadsheet_service.spreadsheets()
+result_1 = sheet_1.values().get(spreadsheetId=SPREADSHEET_ID, range=RANGE_NAME_1).execute()
+values_1 = result_1.get('values', [])
+max_cols_1 = max(len(row) for row in values_1)
+values_1 = [row + [''] * (max_cols_1 - len(row)) for row in values_1]
+df_1 = pd.DataFrame(values_1[1:], columns=values_1[0])
+df_1 = df_1.fillna('')
+# df_1.head()
 print('CONNECTED TO GOOGLE SHEET')
 
 API_KEY = os.getenv('API_KEY')
@@ -72,6 +82,7 @@ if WEBHOOK_URL not in webhook_url_list:
     )
 print('CONNECTED TO NYLAS AND INTEGRATED WEBHOOK')
 
+empty_status_df_copy = df.loc[df['Status'] == ''].copy()
 def convert_links(html):
     pattern = r'<a href="([^"]+)">([^<]+)</a>'
 
@@ -111,7 +122,14 @@ for index, row in df.loc[df['Status'] == ''].iterrows():
         df.at[index, 'Status'] = payload['data']['folders'][0]
         df.at[index, 'Tracking'] = payload['data']['folders'][0]
         df.at[index, 'Date'] = pendulum.from_timestamp(payload['data']['date'], tz="Asia/Ho_Chi_Minh").to_datetime_string()
+        if index in empty_status_df_copy.index:
+            empty_status_df_copy.at[index, 'Date'] = df.at[index, 'Date']
+            empty_status_df_copy.at[index, 'Message ID'] = payload['data']['id']
         time.sleep(5)
+empty_status_df_copy.reset_index(drop=True, inplace=True)
+df_1 = pd.concat([df_1, empty_status_df_copy], ignore_index=True).drop_duplicates(subset=['Name', 'Email'], keep='last')
+df_1.reset_index(drop=True, inplace=True)
+df_1.drop(columns=['Status', 'Merge status', 'Tracking'], inplace=True)
 print('SENT MESSAGES TO THE SPECIFIC EMAILS')
 
 def pagination_tracking():
@@ -169,7 +187,7 @@ def pagination_message():
 
     while True:
         messages = nylas.messages.list(GRANT_ID,
-            query_params={"limit": 10, **({"page_token": next_cursor} if next_cursor is not None else {}), "select": "grant_id,from,object,id,thread_id,subject,snippet,to,bcc,cc,reply_to,attachments,folders,headers,unread,starred,created_at,date,schedule_id,send_at", "from": EMAIL, "in": "SENT", "received_after": pendulum.parse(df.loc[0, 'Date'], tz="Asia/Ho_Chi_Minh").int_timestamp}
+            query_params={"limit": 10, **({"page_token": next_cursor} if next_cursor is not None else {}), "select": "grant_id,from,object,id,thread_id,subject,snippet,to,bcc,cc,reply_to,attachments,folders,headers,unread,starred,created_at,date,schedule_id,send_at", "from": EMAIL, "in": "SENT", "received_after": pendulum.parse(df_1.loc[0, 'Date'], tz="Asia/Ho_Chi_Minh").int_timestamp}
         )
         time.sleep(2)
 
@@ -187,6 +205,7 @@ message_generators = pagination_message()
 for generator in message_generators:
     print(generator)
 flatten_message_list = list(itertools.chain.from_iterable(message.data for message in message_list))
+filter_flatten_message_list = [sent_message for index, row in df_1.iterrows() for sent_message in flatten_message_list if row['Email'] == sent_message.to[0]['email'] and row['Message ID'] == sent_message.id]
 print('TRACKED MESSAGE')
 
 email_list, track_list, email_track_dict = [], [], {}
@@ -199,7 +218,7 @@ for flatten_payload_model in flatten_payload_model_list_final:
         payload_id = response_id.json()
         time.sleep(2)
 
-        for index, message in enumerate(flatten_message_list):
+        for index, message in enumerate(filter_flatten_message_list):
             if payload_id['data']['body']['data']['object']['message_id'] == message.id:
                 if len(list(df.loc[df['Email'] == message.to[0]['email'], 'Tracking'])[0].split(', ')) == 3:
                     continue
@@ -237,7 +256,6 @@ for index, row in df.iterrows():
         email_track_list = list(email_track_dict.values())
         email_track_list_final = [{'email': email_track['email'], 'status': list(set(email_track['status']))} for email_track in email_track_list]
 
-        time.sleep(2)
         for email_track in email_track_list_final:
             if df.loc[index, 'Email'] == email_track['email']:
                 df.loc[index, 'Tracking'] += ', ' + ', '.join(email_track['status'])
@@ -245,12 +263,18 @@ for index, row in df.iterrows():
                 deduplicated_tracking = ', '.join(dict.fromkeys(duplicated_tracking.split(', ')))
                 df.loc[index, 'Tracking'] = deduplicated_tracking
 
-        time.sleep(2)
+        # UPDATE GOOGLE SHEET DATA.
         updated_values = [df.columns.tolist()] + df.values.tolist()
         body = {'values': updated_values}
         result = spreadsheet_service.spreadsheets().values().update(
             spreadsheetId=SPREADSHEET_ID, range=RANGE_NAME,
             valueInputOption='RAW', body=body).execute()
+
+        updated_values_1 = [df_1.columns.tolist()] + df_1.values.tolist()
+        body_1 = {'values': updated_values_1}
+        result_1 = spreadsheet_service.spreadsheets().values().update(
+            spreadsheetId=SPREADSHEET_ID, range=RANGE_NAME_1,
+            valueInputOption='RAW', body=body_1).execute()
     except:
         print(f"All recipients have not opened or clicked the link of the email yet")
         updated_values = [df.columns.tolist()] + df.values.tolist()
@@ -258,6 +282,11 @@ for index, row in df.iterrows():
         result = spreadsheet_service.spreadsheets().values().update(
             spreadsheetId=SPREADSHEET_ID, range=RANGE_NAME,
             valueInputOption='RAW', body=body).execute()
-        time.sleep(2)
+
+        updated_values_1 = [df_1.columns.tolist()] + df_1.values.tolist()
+        body_1 = {'values': updated_values_1}
+        result_1 = spreadsheet_service.spreadsheets().values().update(
+            spreadsheetId=SPREADSHEET_ID, range=RANGE_NAME_1,
+            valueInputOption='RAW', body=body_1).execute()
         break
 print('UPDATED GOOGLE SHEET DATA')
