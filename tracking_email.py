@@ -94,7 +94,6 @@ def convert_links(html):
     modified_html = re.sub(pattern, replacement, html)
     return modified_html
 
-sent_message_list = []
 for index, row in df.loc[df['Status'] == ''].iterrows():
     email_to = str(row['Email']).strip()
     if '@' in email_to and '.' in email_to.split('@')[1]:
@@ -108,7 +107,7 @@ for index, row in df.loc[df['Status'] == ''].iterrows():
             "Accept-Encoding": "gzip"
             # "Content-Type": "multipart/form-data"
         }
-        message = '{{"subject": \"{email_subject}\", "body": \"{email_message}\", "to": [{{"name": \"{name}\", "email": \"{email}\"}}], "reply_to": [{{"name": \"{name}\", "email": \"{email}\"}}], "tracking_options": {{"opens": true, "links": true, "thread_replies": false}}}}'.format(email_subject=email_subject, email_message=convert_links(email_message), name=row.get("Name"), email=email_to)
+        message = '{{"subject": \"{email_subject}\", "body": \"{email_message}\", "to": [{{"name": \"{name}\", "email": \"{email}\"}}], "reply_to": [{{"name": \"{name}\", "email": \"{email}\"}}], "tracking_options": {{"opens": true, "links": true, "thread_replies": true, "label": "{label}\"}}, "send_at": {email_send_at}}}'.format(email_subject=email_subject, email_message=convert_links(email_message), name=row.get("Name"), email=email_to, email_send_at=pendulum.now().add(minutes=2).int_timestamp, label=pendulum.now().int_timestamp)
 
         files = {
             'message': (None, message),
@@ -120,20 +119,20 @@ for index, row in df.loc[df['Status'] == ''].iterrows():
 
         response = requests.post(url, headers=headers, files=files)
         payload = response.json()
-        print(payload['data']['id'])
-        sent_message_list.append(payload)
+        print(payload['data']['schedule_id'])
 
-        df.at[index, 'Status'] = payload['data']['folders'][0]
-        df.at[index, 'Tracking'] = payload['data']['folders'][0]
-        df.at[index, 'Date'] = pendulum.from_timestamp(payload['data']['date'], tz="Asia/Ho_Chi_Minh").to_datetime_string()
+        df.at[index, 'Status'] = 'SENT'
+        df.at[index, 'Tracking'] = 'SENT'
+        df.at[index, 'Date'] = pendulum.from_timestamp(int(payload['data']['tracking_options']['label']), tz="Asia/Ho_Chi_Minh").to_datetime_string()
         if index in empty_status_df_copy.index:
             empty_status_df_copy.at[index, 'Title'] = payload['data']['subject']
             empty_status_df_copy.at[index, 'Content'] = payload['data']['body']
+            empty_status_df_copy.at[index, 'Schedule ID'] = payload['data']['schedule_id']
+            empty_status_df_copy.at[index, 'Schedule Date'] = pendulum.from_timestamp(payload['data']['send_at'], tz="Asia/Ho_Chi_Minh").to_datetime_string()
             empty_status_df_copy.at[index, 'Date'] = df.at[index, 'Date']
-            empty_status_df_copy.at[index, 'Message ID'] = payload['data']['id']
         time.sleep(5)
 empty_status_df_copy.reset_index(drop=True, inplace=True)
-df_1 = pd.concat([df_1, empty_status_df_copy], ignore_index=True).drop_duplicates(subset=['Name', 'Title', 'Content', 'Email'], keep='last')
+df_1 = pd.concat([df_1, empty_status_df_copy], ignore_index=True).drop_duplicates(subset=['Name', 'Title', 'Content', 'Email'], keep='last').fillna('')
 df_1.reset_index(drop=True, inplace=True)
 df_1.drop(columns=['Status', 'Merge status', 'Tracking'], inplace=True)
 print('SENT MESSAGES TO THE SPECIFIC EMAILS')
@@ -191,28 +190,16 @@ def pagination_message():
     global message_list
     message_list = []
 
-    while True:
-        messages = nylas.messages.list(GRANT_ID,
-                query_params={"limit": 10, **({"page_token": next_cursor} if next_cursor is not None else {}), "select": "grant_id,from,object,id,body,thread_id,subject,snippet,to,bcc,cc,reply_to,attachments,folders,headers,unread,starred,created_at,date,schedule_id,send_at", "from": EMAIL, "in": "SENT", "received_after": pendulum.parse(df_1.loc[0, 'Date'], tz="Asia/Ho_Chi_Minh").int_timestamp}
-            )
-        time.sleep(2)
-
-        message_list.append(messages)
-
-        if hasattr(messages, 'next_cursor') and messages.next_cursor:
-            next_cursor = messages.next_cursor
-            yield next_cursor
-            time.sleep(2)
-        else:
-            time.sleep(2)
-            break
+    messages = nylas.messages.list_scheduled_messages(GRANT_ID)
+    time.sleep(5)
+    message_list.append(messages)
 
 message_generators = pagination_message()
 for generator in message_generators:
     print(generator)
 flatten_message_list = list(itertools.chain.from_iterable(message.data for message in message_list))
-filter_flatten_message_list = [sent_message for index, row in df_1.iterrows() for sent_message in flatten_message_list if row['Email'] == sent_message.to[0]['email'] and row['Message ID'] == sent_message.id and row['Title'] == sent_message.subject and row['Content'] == sent_message.body]
-filter_flatten_message_list_final = list(itertools.filterfalse(lambda message: message.id not in set(df_1.loc[df_1['Date'].isin(df['Date']), 'Message ID'].values), filter_flatten_message_list))
+filter_flatten_message_list = [sent_message for index, row in df_1.iterrows() for sent_message in flatten_message_list if row['Schedule ID'] == sent_message.schedule_id]
+filter_flatten_message_list_final = list(itertools.filterfalse(lambda message: message.schedule_id not in set(df_1.loc[df_1['Date'].isin(df['Date']), 'Schedule ID'].values), filter_flatten_message_list))
 print('TRACKED MESSAGE')
 
 email_list, track_list, email_track_dict, email_message_id_list = [], [], {}, []
@@ -226,26 +213,89 @@ for flatten_payload_model in flatten_payload_model_list_final:
         payload_id = response_id.json()
 
         for index, message in enumerate(filter_flatten_message_list_final):
-            if payload_id['data']['body']['data']['object']['message_id'] == message.id and df_1.loc[df_1['Date'].isin(df['Date']), 'Message ID'].values[index] == message.id:
-                if len(df.loc[df['Date'] == df_1.loc[df_1['Date'].isin(df['Date']), 'Date'].values[index], 'Tracking'].values[0].split(', ')) == 3:
+            if payload_id['data']['body']['data']['object']['schedule_id'] == message.schedule_id and df_1.loc[df_1['Date'].isin(df['Date']), 'Schedule ID'].values[index] == message.schedule_id:
+                if len(df.loc[df['Date'] == df_1.loc[df_1['Date'].isin(df['Date']), 'Date'].values[index], 'Tracking'].values[0].split(', ')) == 1:
+                    if payload_id['data']['body']['type'] == 'message.send_success':
+                        df['Tracking'] = df['Tracking'].mask(df['Date'] == df_1.loc[df_1['Date'].isin(df['Date']), 'Date'].values[index], 'SENT SUCCESS')
+                        df_1['Message ID'] = df_1['Message ID'].mask((df_1['Schedule ID'] == payload_id['data']['body']['data']['object']['schedule_id']) & (df_1['Schedule Date'] == pendulum.from_timestamp(payload_id['data']['body']['data']['object']['send_at'], tz="Asia/Ho_Chi_Minh").to_datetime_string()), payload_id['data']['body']['data']['object']['id'])
+                    elif payload_id['data']['body']['type'] == 'message.send_failed':
+                        df['Tracking'] = df['Tracking'].mask(df['Date'] == df_1.loc[df_1['Date'].isin(df['Date']), 'Date'].values[index], 'SENT FAILED')
+        time.sleep(2)
+    except:
+        print(flatten_payload_model['id'])
+
+for flatten_payload_model in flatten_payload_model_list_final:
+    try:
+        response_id = requests.get(f"https://api.hookdeck.com/2024-09-01/requests/{flatten_payload_model['id']}", headers={
+            "Authorization": f"Bearer {API_KEY_WEBHOOK_URL}",
+            "Content-Type": "application/json",
+            "Accept-Encoding": "gzip"
+        })
+        payload_id = response_id.json()
+        for index, message in enumerate(filter_flatten_message_list_final):
+            if payload_id['data']['body']['data']['object']['message_id'] == df_1.loc[df_1['Date'].isin(df['Date']), 'Message ID'].values[index]:
+                if len(df.loc[df['Date'] == df_1.loc[df_1['Date'].isin(df['Date']), 'Date'].values[index], 'Tracking'].values[0].split(', ')) == 4:
                     continue
+                elif len(df.loc[df['Date'] == df_1.loc[df_1['Date'].isin(df['Date']), 'Date'].values[index], 'Tracking'].values[0].split(', ')) == 3:
+                    if payload_id['data']['body']['type'] == 'message.link_clicked' and 'LINK CLICKED' not in df.loc[df['Date'] == df_1.loc[df_1['Date'].isin(df['Date']), 'Date'].values[index], 'Tracking'].values[0].split(', ') and 'THREAD REPLIED' in df.loc[df['Date'] == df_1.loc[df_1['Date'].isin(df['Date']), 'Date'].values[index], 'Tracking'].values[0].split(', '):
+                        email_list.append(df.loc[df['Date'] == df_1.loc[df_1['Date'].isin(df['Date']), 'Date'].values[index], 'Email'].values[0])
+                        email_message_id_list.append(payload_id['data']['body']['data']['object']['message_id'] )
+                        track_list.append('LINK CLICKED')
                 elif len(df.loc[df['Date'] == df_1.loc[df_1['Date'].isin(df['Date']), 'Date'].values[index], 'Tracking'].values[0].split(', ')) == 2:
                     if payload_id['data']['body']['type'] == 'message.link_clicked':
-                        email_list.append(message.to[0]['email'])
-                        email_message_id_list.append(message.id)
-                        track_list.append('CLICKED')
+                        email_list.append(df.loc[df['Date'] == df_1.loc[df_1['Date'].isin(df['Date']), 'Date'].values[index], 'Email'].values[0])
+                        email_message_id_list.append(payload_id['data']['body']['data']['object']['message_id'] )
+                        track_list.append('LINK CLICKED')
                 elif len(df.loc[df['Date'] == df_1.loc[df_1['Date'].isin(df['Date']), 'Date'].values[index], 'Tracking'].values[0].split(', ')) == 1:
-                    email_list.append(message.to[0]['email'])
-                    email_message_id_list.append(message.id)
                     if payload_id['data']['body']['type'] == 'message.opened':
+                        email_list.append(df.loc[df['Date'] == df_1.loc[df_1['Date'].isin(df['Date']), 'Date'].values[index], 'Email'].values[0])
+                        email_message_id_list.append(payload_id['data']['body']['data']['object']['message_id'] )
                         track_list.append('OPENED')
-                    elif payload_id['data']['body']['type'] == 'message.link_clicked':
-                        track_list.append('CLICKED')
-                break
+                    elif payload_id['data']['body']['type'] == 'message.bounce_detected':
+                        email_list.append(df.loc[df['Date'] == df_1.loc[df_1['Date'].isin(df['Date']), 'Date'].values[index], 'Email'].values[0])
+                        email_message_id_list.append(payload_id['data']['body']['data']['object']['message_id'] )
+                        track_list.append('BOUNCE DETECTED')
+        time.sleep(2)
+    except:
+        print(flatten_payload_model['id'])
+
+for flatten_payload_model in flatten_payload_model_list_final:
+    try:
+        response_id = requests.get(f"https://api.hookdeck.com/2024-09-01/requests/{flatten_payload_model['id']}", headers={
+            "Authorization": f"Bearer {API_KEY_WEBHOOK_URL}",
+            "Content-Type": "application/json",
+            "Accept-Encoding": "gzip"
+        })
+        payload_id = response_id.json()
+        for index, message in enumerate(filter_flatten_message_list_final):
+            if payload_id['data']['body']['data']['object']['root_message_id'] == df_1.loc[df_1['Date'].isin(df['Date']), 'Message ID'].values[index]:
+                if len(df.loc[df['Date'] == df_1.loc[df_1['Date'].isin(df['Date']), 'Date'].values[index], 'Tracking'].values[0].split(', ')) == 4:
+                    continue
+                elif len(df.loc[df['Date'] == df_1.loc[df_1['Date'].isin(df['Date']), 'Date'].values[index], 'Tracking'].values[0].split(', ')) == 3:
+                    if payload_id['data']['body']['type'] == 'thread.replied' and 'THREAD REPLIED' not in df.loc[df['Date'] == df_1.loc[df_1['Date'].isin(df['Date']), 'Date'].values[index], 'Tracking'].values[0].split(', ') and 'LINK CLICKED' in df.loc[df['Date'] == df_1.loc[df_1['Date'].isin(df['Date']), 'Date'].values[index], 'Tracking'].values[0].split(', '):
+                        email_list.append(df.loc[df['Date'] == df_1.loc[df_1['Date'].isin(df['Date']), 'Date'].values[index], 'Email'].values[0])
+                        email_message_id_list.append(payload_id['data']['body']['data']['object']['root_message_id'] )
+                        track_list.append('THREAD REPLIED')
+                elif len(df.loc[df['Date'] == df_1.loc[df_1['Date'].isin(df['Date']), 'Date'].values[index], 'Tracking'].values[0].split(', ')) == 2:
+                    if payload_id['data']['body']['type'] == 'thread.replied':
+                        email_list.append(df.loc[df['Date'] == df_1.loc[df_1['Date'].isin(df['Date']), 'Date'].values[index], 'Email'].values[0])
+                        email_message_id_list.append(payload_id['data']['body']['data']['object']['root_message_id'] )
+                        track_list.append('THREAD REPLIED')
+                elif len(df.loc[df['Date'] == df_1.loc[df_1['Date'].isin(df['Date']), 'Date'].values[index], 'Tracking'].values[0].split(', ')) == 1:
+                    if payload_id['data']['body']['type'] == 'message.opened':
+                        email_list.append(df.loc[df['Date'] == df_1.loc[df_1['Date'].isin(df['Date']), 'Date'].values[index], 'Email'].values[0])
+                        email_message_id_list.append(payload_id['data']['body']['data']['object']['message_id'] )
+                        track_list.append('OPENED')
+                    elif payload_id['data']['body']['type'] == 'message.bounce_detected':
+                        email_list.append(df.loc[df['Date'] == df_1.loc[df_1['Date'].isin(df['Date']), 'Date'].values[index], 'Email'].values[0])
+                        email_message_id_list.append(payload_id['data']['body']['data']['object']['message_id'] )
+                        track_list.append('BOUNCE DETECTED')
         time.sleep(2)
     except:
         print(flatten_payload_model['id'])
 print('INVOKED INCOMING REQUESTS FROM WEBHOOK URL AND ADDED TRACKING STATUS TRIGGERED FROM NYLAS')
+
+print(list(zip(email_list, track_list, email_message_id_list)))
 
 def update_status():
     global status_dict
