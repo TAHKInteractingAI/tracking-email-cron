@@ -1,5 +1,6 @@
 from __future__ import print_function
-from googleapiclient.discovery import build 
+from googleapiclient.discovery import build
+from googleapiclient.errors import HttpError
 from google.oauth2 import service_account
 import pandas as pd
 import os
@@ -323,15 +324,31 @@ for index, generator in status_final_generators:
         except:
             pass
 
-updated_values = [df.columns.tolist()] + df.values.tolist()
-body = {'values': updated_values}
-result = spreadsheet_service.spreadsheets().values().update(
-    spreadsheetId=SPREADSHEET_ID, range=RANGE_NAME,
-    valueInputOption='RAW', body=body).execute()
-
-updated_values_1 = [df_1.columns.tolist()] + df_1.values.tolist()
-body_1 = {'values': updated_values_1}
-result_1 = spreadsheet_service.spreadsheets().values().update(
-    spreadsheetId=SPREADSHEET_ID, range=RANGE_NAME_1,
-    valueInputOption='RAW', body=body_1).execute()
+max_retries = 5
+for attempt in range(max_retries):
+    try:
+        updated_values = [df.columns.tolist()] + df.values.tolist()
+        body = {'values': updated_values}
+        result = spreadsheet_service.spreadsheets().values().update(
+            spreadsheetId=SPREADSHEET_ID, range=RANGE_NAME,
+            valueInputOption='RAW', body=body).execute()
+        print(f"Update {RANGE_NAME} successful")
+        updated_values_1 = [df_1.columns.tolist()] + df_1.values.tolist()
+        body_1 = {'values': updated_values_1}
+        result_1 = spreadsheet_service.spreadsheets().values().update(
+            spreadsheetId=SPREADSHEET_ID, range=RANGE_NAME_1,
+            valueInputOption='RAW', body=body_1).execute()
+        print(f"Update {RANGE_NAME_1} successful")
+        break
+    except BrokenPipeError:
+        print(f"Broken pipe error on attempt {attempt + 1}")
+        time.sleep(2 ** attempt)
+    except HttpError as e:
+        print(f"Google API error: {e}")
+        time.sleep(2 ** attempt)
+    except Exception as e:
+        print(f"Unexpected error: {e}")
+        time.sleep(2 ** attempt)
+else:
+    print(f"Failed after {max_retries} retries.")
 print('UPDATED GOOGLE SHEET DATA')
